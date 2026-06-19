@@ -150,53 +150,74 @@ export async function requireMfaIfEnrolled(
   const admin = createClient(supabaseUrl, serviceKey, {
     auth: { persistSession: false },
   });
-  const { data, error } =
-    await admin.auth.mfa.getAuthenticatorAssuranceLevel(token);
 
-  if (error) {
-    devLog("[auth/mfa] assurance lookup failed", {
-      method: req.method,
-      path: req.originalUrl,
-      userId: res.locals.userId,
-      error: error.message,
-    });
-    res.status(401).json({ detail: error.message });
-    return;
-  }
-
-  devLog("[auth/mfa] assurance level", {
-    method: req.method,
-    path: req.originalUrl,
-    userId: res.locals.userId,
-    currentLevel: data.currentLevel,
-    nextLevel: data.nextLevel,
-    required: data.nextLevel === "aal2" && data.currentLevel !== "aal2",
-  });
-
-  if (isDev) {
+  try {
     const { data: userData, error: userError } = await admin.auth.getUser(token);
-    devLog("[auth/mfa] user factors", {
+    const verifiedFactors = (userData.user?.factors ?? []).filter(
+      (factor) => factor.status === "verified",
+    );
+
+    if (isDev) {
+      devLog("[auth/mfa] user factors", {
+        method: req.method,
+        path: req.originalUrl,
+        userId: res.locals.userId,
+        factorCount: userData.user?.factors?.length ?? 0,
+        factors: summarizeMfaFactors(userData.user?.factors),
+        error: userError?.message ?? null,
+      });
+    }
+
+    // Only require step-up MFA for users who actually enrolled a verified factor.
+    if (verifiedFactors.length === 0) {
+      next();
+      return;
+    }
+
+    const { data, error } =
+      await admin.auth.mfa.getAuthenticatorAssuranceLevel(token);
+
+    if (error) {
+      devLog("[auth/mfa] assurance lookup failed", {
+        method: req.method,
+        path: req.originalUrl,
+        userId: res.locals.userId,
+        error: error.message,
+      });
+      res.status(401).json({ detail: error.message });
+      return;
+    }
+
+    devLog("[auth/mfa] assurance level", {
       method: req.method,
       path: req.originalUrl,
       userId: res.locals.userId,
-      factorCount: userData.user?.factors?.length ?? 0,
-      factors: summarizeMfaFactors(userData.user?.factors),
-      error: userError?.message ?? null,
+      currentLevel: data.currentLevel,
+      nextLevel: data.nextLevel,
+      required: data.nextLevel === "aal2" && data.currentLevel !== "aal2",
     });
-  }
 
-  if (data.nextLevel === "aal2" && data.currentLevel !== "aal2") {
-    devLog("[auth/mfa] verification required", {
+    if (data.nextLevel === "aal2" && data.currentLevel !== "aal2") {
+      devLog("[auth/mfa] verification required", {
+        method: req.method,
+        path: req.originalUrl,
+        userId: res.locals.userId,
+      });
+      res.status(403).json({
+        code: "mfa_verification_required",
+        detail: "MFA verification required",
+      });
+      return;
+    }
+
+    next();
+  } catch (error) {
+    devLog("[auth/mfa] unexpected failure", {
       method: req.method,
       path: req.originalUrl,
       userId: res.locals.userId,
+      error: error instanceof Error ? error.message : String(error),
     });
-    res.status(403).json({
-      code: "mfa_verification_required",
-      detail: "MFA verification required",
-    });
-    return;
+    res.status(500).json({ detail: "MFA check failed" });
   }
-
-  next();
 }
